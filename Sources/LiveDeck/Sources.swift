@@ -198,6 +198,8 @@ final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
     private var session: AVCaptureSession?
     private let queue = DispatchQueue(label: "audio.queue")
     var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+    var onLevel: ((Float) -> Void)?   // 0...1, smoothed, delivered on main
+    private var smoothed: Float = 0
 
     static func availableDevices() -> [AudioDeviceInfo] {
         let discovery = AVCaptureDevice.DiscoverySession(
@@ -228,5 +230,13 @@ final class AudioCapture: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         onSampleBuffer?(sampleBuffer)
+        // Level meter from the connection's audio channels (dBFS → 0...1)
+        if let ch = connection.audioChannels.first {
+            let db = ch.averagePowerLevel                       // typically -160...0 dBFS
+            let lin = Float(pow(10.0, Double(db) / 20.0))       // 0...1
+            smoothed = max(lin, smoothed * 0.82)                // fast attack, slow release
+            let level = min(1, max(0, smoothed))
+            DispatchQueue.main.async { [weak self] in self?.onLevel?(level) }
+        }
     }
 }

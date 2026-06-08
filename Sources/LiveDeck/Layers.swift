@@ -57,6 +57,37 @@ final class Layer: ObservableObject, Identifiable {
     var qrCache: CGImage?
     var qrCachedText: String = ""
 
+    // mimoLive-style variants: saved states you cycle through and push live
+    @Published var variants: [LayerVariant] = []
+    @Published var activeVariant: Int = 0
+
+    func captureVariant() {
+        let c = accent.rgbaComponents()
+        let v = LayerVariant(name: "Variant \(variants.count + 1)",
+                             text1: text1, text2: text2,
+                             aR: c.0, aG: c.1, aB: c.2, aA: c.3,
+                             number1: number1, scoreA: scoreA, scoreB: scoreB,
+                             position: position, style: style)
+        variants.append(v)
+        activeVariant = variants.count - 1
+    }
+
+    func applyVariant(_ i: Int) {
+        guard variants.indices.contains(i) else { return }
+        let v = variants[i]
+        text1 = v.text1; text2 = v.text2
+        accent = Color(.sRGB, red: v.aR, green: v.aG, blue: v.aB, opacity: v.aA)
+        number1 = v.number1; scoreA = v.scoreA; scoreB = v.scoreB
+        position = v.position; style = v.style
+        activeVariant = i
+    }
+
+    func cycleVariant(_ delta: Int) {
+        guard !variants.isEmpty else { return }
+        let n = variants.count
+        applyVariant(((activeVariant + delta) % n + n) % n)
+    }
+
     init(kind: Kind) {
         self.kind = kind
         self.name = kind.rawValue
@@ -296,12 +327,22 @@ enum LayerRenderer {
 
 // MARK: - Save / Load model
 
+struct LayerVariant: Codable, Identifiable {
+    var id = UUID()
+    var name: String
+    var text1: String, text2: String
+    var aR: Double, aG: Double, aB: Double, aA: Double
+    var number1: Double, scoreA: Int, scoreB: Int
+    var position: Int, style: Int
+}
+
 struct ShowLayer: Codable {
     var kind: String, name: String, isLive: Bool
     var text1: String, text2: String
     var aR: Double, aG: Double, aB: Double, aA: Double
     var number1: Double, scoreA: Int, scoreB: Int
     var position: Int, use24h: Bool, style: Int
+    var variants: [LayerVariant] = []
 }
 
 struct ShowFile: Codable {
@@ -324,7 +365,8 @@ extension Layer {
                          text1: text1, text2: text2,
                          aR: c.0, aG: c.1, aB: c.2, aA: c.3,
                          number1: number1, scoreA: scoreA, scoreB: scoreB,
-                         position: position, use24h: use24h, style: style)
+                         position: position, use24h: use24h, style: style,
+                         variants: variants)
     }
 
     static func from(_ s: ShowLayer) -> Layer? {
@@ -334,6 +376,7 @@ extension Layer {
         l.accent = Color(.sRGB, red: s.aR, green: s.aG, blue: s.aB, opacity: s.aA)
         l.number1 = s.number1; l.scoreA = s.scoreA; l.scoreB = s.scoreB
         l.position = s.position; l.use24h = s.use24h; l.style = s.style
+        l.variants = s.variants
         if kind == .countdown { l.remaining = s.number1 * 60 }
         return l
     }

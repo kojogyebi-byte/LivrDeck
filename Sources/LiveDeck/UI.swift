@@ -106,10 +106,45 @@ struct CenterPanel: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            ZStack(alignment: .topLeading) {
+            ZStack {
                 ProgramPreview().aspectRatio(16.0 / 9.0, contentMode: .fit).padding(16)
-                Text("PROGRAM").font(.system(size: 10, weight: .bold)).kerning(2)
-                    .foregroundColor(.secondary).padding(.leading, 20).padding(.top, 4)
+
+                // Safe-area guides
+                if engine.showSafeGuides {
+                    GeometryReader { geo in
+                        let w = geo.size.width, h = geo.size.height
+                        Rectangle().stroke(Color.white.opacity(0.35), lineWidth: 1)
+                            .frame(width: w * 0.9, height: h * 0.9)
+                            .position(x: w / 2, y: h / 2)
+                        Rectangle().stroke(Color.yellow.opacity(0.3), lineWidth: 1)
+                            .frame(width: w * 0.8, height: h * 0.8)
+                            .position(x: w / 2, y: h / 2)
+                    }
+                    .padding(16).allowsHitTesting(false)
+                }
+
+                // Program bar (top): resolution + fps + activity dot
+                VStack {
+                    HStack(spacing: 8) {
+                        Circle().fill(engine.isRecording ? Color.red : Color.green)
+                            .frame(width: 9, height: 9)
+                        Text(engine.isRecording ? "LIVE • REC" : "PROGRAM")
+                            .font(.system(size: 10, weight: .bold)).kerning(1.5)
+                        Spacer()
+                        Text("\(engine.width)×\(engine.height)  •  \(engine.fps) fps")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.horizontal, 26).padding(.top, 22)
+                    Spacer()
+                }
+
+                // Audio level meter (right edge)
+                HStack {
+                    Spacer()
+                    AudioMeter(level: engine.audioLevel)
+                        .frame(width: 8).padding(.trailing, 24).padding(.vertical, 40)
+                }
             }
             .frame(maxHeight: .infinity)
 
@@ -130,8 +165,8 @@ struct CenterPanel: View {
                         .font(.system(.body, design: .monospaced).weight(.bold)).foregroundColor(.red)
                 }
 
-                Button { engine.snapshot() } label: { Label("Snapshot", systemImage: "camera") }
-                Button { engine.openOutputWindow() } label: { Label("Output", systemImage: "rectangle.expand.vertical") }
+                Button { engine.openMultiviewWindow() } label: { Label("Multiview", systemImage: "rectangle.grid.2x2") }
+                Toggle("Guides", isOn: $engine.showSafeGuides).toggleStyle(.button).font(.system(size: 11))
 
                 Spacer()
 
@@ -145,15 +180,18 @@ struct CenterPanel: View {
 
                 Picker("", selection: Binding(
                     get: { engine.selectedAudioDeviceID ?? "" },
-                    set: { engine.selectedAudioDeviceID = $0.isEmpty ? nil : $0 })) {
+                    set: { engine.setAudioDevice($0.isEmpty ? nil : $0) })) {
                     Text("Default mic").tag("")
                     ForEach(engine.audioDevices) { d in Text(d.name).tag(d.id) }
                 }
-                .frame(maxWidth: 170).help("Recording audio input (e.g. your mixer's USB feed)")
+                .frame(maxWidth: 160).help("Recording / metering audio input")
 
                 Toggle("Crossfade", isOn: $engine.useFade).toggleStyle(.switch).font(.system(size: 11))
             }
             .padding(12)
+
+            Divider()
+            OutputDestinations()
         }
     }
 }
@@ -162,6 +200,70 @@ struct ProgramPreview: NSViewRepresentable {
     @EnvironmentObject var engine: Engine
     func makeNSView(context: Context) -> FrameNSView { let v = FrameNSView(frame: .zero); engine.addConsumer(v); return v }
     func updateNSView(_ nsView: FrameNSView, context: Context) {}
+}
+
+struct AudioMeter: View {
+    var level: Float   // 0...1
+    var body: some View {
+        GeometryReader { geo in
+            let h = geo.size.height
+            let fill = CGFloat(min(1, max(0, level))) * h
+            ZStack(alignment: .bottom) {
+                RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.5))
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(LinearGradient(colors: [.green, .green, .yellow, .red],
+                                         startPoint: .bottom, endPoint: .top))
+                    .frame(height: fill)
+            }
+        }
+    }
+}
+
+struct OutputDestinations: View {
+    @EnvironmentObject var engine: Engine
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("OUTPUT DESTINATIONS").font(.system(size: 10, weight: .heavy)).kerning(2)
+                .foregroundColor(.secondary)
+            HStack(spacing: 8) {
+                DestChip(title: "Record (MP4)", system: "record.circle",
+                         active: engine.fileOutputActive, enabled: true) { engine.toggleRecording() }
+                DestChip(title: "Program Window", system: "rectangle.expand.vertical",
+                         active: engine.programWindowActive, enabled: true) { engine.openOutputWindow() }
+                DestChip(title: "Still Image", system: "camera",
+                         active: false, enabled: true) { engine.snapshot() }
+                DestChip(title: "Live Stream", system: "dot.radiowaves.left.and.right",
+                         active: false, enabled: false) {}
+                DestChip(title: "NDI / Syphon", system: "antenna.radiowaves.left.and.right",
+                         active: false, enabled: false) {}
+                DestChip(title: "Virtual Camera", system: "camera.metering.center.weighted",
+                         active: false, enabled: false) {}
+            }
+            Text("Greyed destinations require licensed SDKs (NDI/Syphon/virtual camera) or a streaming relay — planned for a later version.")
+                .font(.system(size: 9)).foregroundColor(.secondary)
+        }
+        .padding(.horizontal, 12).padding(.vertical, 10)
+    }
+}
+
+struct DestChip: View {
+    var title: String; var system: String; var active: Bool; var enabled: Bool; var action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 4) {
+                Image(systemName: system).font(.system(size: 14))
+                Text(title).font(.system(size: 9)).lineLimit(1)
+            }
+            .frame(width: 86, height: 46)
+            .background(active ? Color.red.opacity(0.25) : Color(white: 0.12))
+            .overlay(RoundedRectangle(cornerRadius: 6)
+                .stroke(active ? Color.red : Color(white: 0.22), lineWidth: 1))
+            .cornerRadius(6)
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.4)
+    }
 }
 
 // MARK: - Layers
@@ -230,9 +332,15 @@ struct LayerInspector: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text(layer.kind.rawValue.uppercased()).font(.system(size: 11, weight: .heavy)).kerning(1.5).foregroundColor(.orange)
+            HStack {
+                Text(layer.kind.rawValue.uppercased()).font(.system(size: 11, weight: .heavy)).kerning(1.5).foregroundColor(.orange)
+                Spacer()
+                Circle().fill(layer.isLive ? Color.red : Color(white: 0.3)).frame(width: 9, height: 9)
+            }
             TextField("Layer name", text: $layer.name)
 
+            VariantsView(layer: layer)
+            Divider()
             switch layer.kind {
             case .lowerThird:
                 TextField("Name line", text: $layer.text1)
@@ -311,6 +419,50 @@ struct LayerInspector: View {
         }
         .textFieldStyle(.roundedBorder)
         .padding(12)
+    }
+}
+
+// MARK: - Variants (mimoLive-style)
+
+struct VariantsView: View {
+    @ObservedObject var layer: Layer
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("VARIANTS").font(.system(size: 9, weight: .heavy)).kerning(1.5).foregroundColor(.secondary)
+                Spacer()
+                Button { layer.captureVariant() } label: { Image(systemName: "plus") }.buttonStyle(.borderless)
+                    .help("Save current settings as a variant")
+                Button { layer.cycleVariant(-1) } label: { Image(systemName: "chevron.left") }.buttonStyle(.borderless)
+                Button { layer.cycleVariant(1) } label: { Image(systemName: "chevron.right") }.buttonStyle(.borderless)
+            }
+            if layer.variants.isEmpty {
+                Text("Save reusable states (e.g. each speaker's name) and switch them live.")
+                    .font(.system(size: 9)).foregroundColor(.secondary)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 6) {
+                        ForEach(Array(layer.variants.enumerated()), id: \.element.id) { idx, v in
+                            Button { layer.applyVariant(idx) } label: {
+                                Text(v.text1.isEmpty ? v.name : v.text1)
+                                    .font(.system(size: 10)).lineLimit(1)
+                                    .padding(.horizontal, 8).padding(.vertical, 5)
+                                    .background(layer.activeVariant == idx ? Color.orange.opacity(0.3) : Color(white: 0.14))
+                                    .overlay(RoundedRectangle(cornerRadius: 5)
+                                        .stroke(layer.activeVariant == idx ? Color.orange : Color(white: 0.25), lineWidth: 1))
+                                    .cornerRadius(5)
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button("Delete", role: .destructive) {
+                                    if layer.variants.indices.contains(idx) { layer.variants.remove(at: idx) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

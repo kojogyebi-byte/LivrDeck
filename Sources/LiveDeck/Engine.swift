@@ -21,12 +21,24 @@ final class Engine: ObservableObject {
     @Published var audioDevices: [AudioDeviceInfo] = []
     @Published var selectedAudioDeviceID: String?
 
+    @Published var audioLevel: Float = 0
+    @Published var fps: Int = 0
+    @Published var showSafeGuides = false
+
+    // Output destinations (mimoLive-style list with live toggles)
+    @Published var fileOutputActive = false        // mirrors isRecording
+    @Published var programWindowActive = false
+
     private var previousID: UUID?
     private var fade: Double = 1
     private var timer: Timer?
     private var lastFrameTime: CFTimeInterval = 0
+    private var frameCount = 0
+    private var fpsClock: CFTimeInterval = 0
 
     private var consumers = NSHashTable<FrameNSView>.weakObjects()
+    private var multiviewConsumer: FrameNSView?
+    private var multiviewWindow: NSWindow?
 
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
@@ -43,6 +55,7 @@ final class Engine: ObservableObject {
         guard timer == nil else { return }
         audioDevices = AudioCapture.availableDevices()
         lastFrameTime = CACurrentMediaTime()
+        fpsClock = lastFrameTime
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             self?.renderFrame()
         }
@@ -54,6 +67,14 @@ final class Engine: ObservableObject {
                   let input = self.audioInput, input.isReadyForMoreMediaData else { return }
             input.append(sb)
         }
+        audioCapture.onLevel = { [weak self] lvl in self?.audioLevel = lvl }
+        audioCapture.start(deviceID: selectedAudioDeviceID)   // runs continuously for metering
+    }
+
+    /// Switch the metering / recording input device.
+    func setAudioDevice(_ id: String?) {
+        selectedAudioDeviceID = id
+        audioCapture.start(deviceID: id)
     }
 
     func addConsumer(_ v: FrameNSView) { consumers.add(v) }
@@ -154,6 +175,54 @@ final class Engine: ObservableObject {
             let pts = CMClockGetTime(CMClockGetHostTimeClock())
             adaptor.append(pb, withPresentationTime: pts)
         }
+
+        // Multiview grid (broadcast multiviewer of all sources)
+        if let mv = multiviewConsumer, multiviewWindow?.isVisible == true {
+            if let grid = composeMultiview() { mv.show(grid) }
+        }
+
+        // fps
+        frameCount += 1
+        if now - fpsClock >= 1.0 {
+            fps = frameCount
+            frameCount = 0
+            fpsClock = now
+        }
+    }
+
+    private func composeMultiview() -> CGImage? {
+        let cells = sources
+        let n = max(1, cells.count)
+        let cols = Int(ceil(sqrt(Double(n))))
+        let rows = Int(ceil(Double(n) / Double(cols)))
+        let cw = 320, ch = 180
+        let gw = cols * cw, gh = rows * ch
+        guard let ctx = CGContext(data: nil, width: gw, height: gh, bitsPerComponent: 8,
+                                  bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue) else { return nil }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: gw, height: gh))
+        for (i, src) in cells.enumerated() {
+            let cx = (i % cols) * cw
+            let cy = gh - ((i / cols) + 1) * ch   // top-to-bottom
+            let rect = CGRect(x: cx + 4, y: cy + 4, width: cw - 8, height: ch - 8)
+            ctx.saveGState()
+            ctx.clip(to: rect)
+            if let img = src.currentImage() {
+                let iw = CGFloat(img.width), ih = CGFloat(img.height)
+                let s = max(rect.width / iw, rect.height / ih)
+                ctx.draw(img, in: CGRect(x: rect.midX - iw * s / 2, y: rect.midY - ih * s / 2,
+                                         width: iw * s, height: ih * s))
+            } else if let color = (src as? ColorSource)?.color {
+                ctx.setFillColor(color.cgColor); ctx.fill(rect)
+            }
+            ctx.restoreGState()
+            let onAir = programID == src.id
+            ctx.setStrokeColor((onAir ? NSColor.red : NSColor(white: 0.25, alpha: 1)).cgColor)
+            ctx.setLineWidth(onAir ? 4 : 2)
+            ctx.stroke(rect)
+        }
+        return ctx.makeImage()
     }
 
     // MARK: recording
@@ -187,12 +256,11 @@ final class Engine: ObservableObject {
             aIn.expectsMediaDataInRealTime = true
             if w.canAdd(aIn) { w.add(aIn) }
 
-            audioCapture.start(deviceID: selectedAudioDeviceID)
             w.startWriting()
             w.startSession(atSourceTime: CMClockGetTime(CMClockGetHostTimeClock()))
 
             writer = w; videoInput = vIn; audioInput = aIn; adaptor = ad
-            recordSeconds = 0; isRecording = true
+            recordSeconds = 0; isRecording = true; fileOutputActive = true
             recordTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 self?.recordSeconds += 1
             }
@@ -202,9 +270,8 @@ final class Engine: ObservableObject {
     }
 
     private func stopRecording() {
-        isRecording = false
+        isRecording = false; fileOutputActive = false
         recordTimer?.invalidate(); recordTimer = nil
-        audioCapture.stop()
         guard let w = writer else { return }
         videoInput?.markAsFinished(); audioInput?.markAsFinished()
         let url = w.outputURL
@@ -275,6 +342,23 @@ final class Engine: ObservableObject {
         win.isReleasedWhenClosed = false
         win.makeKeyAndOrderFront(nil)
         outputWindow = win
+        programWindowActive = true
+    }
+
+    // MARK: multiview
+
+    func openMultiviewWindow() {
+        if let w = multiviewWindow { w.makeKeyAndOrderFront(nil); return }
+        let view = FrameNSView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
+        multiviewConsumer = view
+        let win = NSWindow(contentRect: NSRect(x: 260, y: 160, width: 960, height: 540),
+                           styleMask: [.titled, .closable, .resizable],
+                           backing: .buffered, defer: false)
+        win.title = "LiveDeck — Multiview"
+        win.contentView = view
+        win.isReleasedWhenClosed = false
+        win.makeKeyAndOrderFront(nil)
+        multiviewWindow = win
     }
 }
 
