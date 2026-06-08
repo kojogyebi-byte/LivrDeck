@@ -3,10 +3,11 @@ import AVFoundation
 import AppKit
 import CoreMedia
 import Combine
+import UniformTypeIdentifiers
 
 final class Engine: ObservableObject {
-    let width = 1280
-    let height = 720
+    @Published var width = 1280
+    @Published var height = 720
 
     @Published var sources: [Source] = []
     @Published var layers: [Layer] = []
@@ -17,20 +18,21 @@ final class Engine: ObservableObject {
     @Published var recordSeconds = 0
     @Published var lastRecordingURL: URL?
 
+    @Published var audioDevices: [AudioDeviceInfo] = []
+    @Published var selectedAudioDeviceID: String?
+
     private var previousID: UUID?
     private var fade: Double = 1
     private var timer: Timer?
     private var lastFrameTime: CFTimeInterval = 0
 
-    // Frame consumers (preview views, output window)
     private var consumers = NSHashTable<FrameNSView>.weakObjects()
 
-    // Recording
     private var writer: AVAssetWriter?
     private var videoInput: AVAssetWriterInput?
     private var audioInput: AVAssetWriterInput?
     private var adaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private let mic = MicCapture()
+    private let audioCapture = AudioCapture()
     private var recordTimer: Timer?
 
     private var outputWindow: NSWindow?
@@ -39,6 +41,7 @@ final class Engine: ObservableObject {
 
     func start() {
         guard timer == nil else { return }
+        audioDevices = AudioCapture.availableDevices()
         lastFrameTime = CACurrentMediaTime()
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
             self?.renderFrame()
@@ -46,7 +49,7 @@ final class Engine: ObservableObject {
         t.tolerance = 0.005
         RunLoop.main.add(t, forMode: .common)
         timer = t
-        mic.onSampleBuffer = { [weak self] sb in
+        audioCapture.onSampleBuffer = { [weak self] sb in
             guard let self, self.isRecording,
                   let input = self.audioInput, input.isReadyForMoreMediaData else { return }
             input.append(sb)
@@ -55,37 +58,18 @@ final class Engine: ObservableObject {
 
     func addConsumer(_ v: FrameNSView) { consumers.add(v) }
 
+    func setResolution(width: Int, height: Int) {
+        guard !isRecording else { return }
+        self.width = width; self.height = height
+    }
+
     // MARK: sources
 
-    func addCamera(_ device: AVCaptureDevice) {
-        let s = CameraSource(device: device)
-        sources.append(s)
-        if programID == nil { take(s.id) }
-    }
-
-    func addScreen() {
-        let s = ScreenSource()
-        sources.append(s)
-        if programID == nil { take(s.id) }
-    }
-
-    func addFile(url: URL) {
-        let s = FileSource(url: url)
-        sources.append(s)
-        if programID == nil { take(s.id) }
-    }
-
-    func addImage(url: URL) {
-        let s = ImageSource(url: url)
-        sources.append(s)
-        if programID == nil { take(s.id) }
-    }
-
-    func addColor() {
-        let s = ColorSource()
-        sources.append(s)
-        if programID == nil { take(s.id) }
-    }
+    func addCamera(_ device: AVCaptureDevice) { let s = CameraSource(device: device); sources.append(s); if programID == nil { take(s.id) } }
+    func addScreen() { let s = ScreenSource(); sources.append(s); if programID == nil { take(s.id) } }
+    func addFile(url: URL) { let s = FileSource(url: url); sources.append(s); if programID == nil { take(s.id) } }
+    func addImage(url: URL) { let s = ImageSource(url: url); sources.append(s); if programID == nil { take(s.id) } }
+    func addColor() { let s = ColorSource(); sources.append(s); if programID == nil { take(s.id) } }
 
     func removeSource(_ id: UUID) {
         if let s = sources.first(where: { $0.id == id }) { s.stop() }
@@ -96,28 +80,16 @@ final class Engine: ObservableObject {
 
     func take(_ id: UUID) {
         guard programID != id else { return }
-        previousID = programID
-        programID = id
-        fade = useFade ? 0 : 1
+        previousID = programID; programID = id; fade = useFade ? 0 : 1
     }
 
     // MARK: layers
 
-    func addLayer(_ kind: Layer.Kind) {
-        let l = Layer(kind: kind)
-        layers.insert(l, at: 0)
-        selectedLayerID = l.id
-    }
-
-    func removeLayer(_ id: UUID) {
-        layers.removeAll { $0.id == id }
-        if selectedLayerID == id { selectedLayerID = nil }
-    }
-
+    func addLayer(_ kind: Layer.Kind) { let l = Layer(kind: kind); layers.insert(l, at: 0); selectedLayerID = l.id }
+    func removeLayer(_ id: UUID) { layers.removeAll { $0.id == id }; if selectedLayerID == id { selectedLayerID = nil } }
     func moveLayer(_ id: UUID, by delta: Int) {
         guard let i = layers.firstIndex(where: { $0.id == id }) else { return }
-        let j = i + delta
-        guard j >= 0, j < layers.count else { return }
+        let j = i + delta; guard j >= 0, j < layers.count else { return }
         layers.swapAt(i, j)
     }
 
@@ -128,7 +100,6 @@ final class Engine: ObservableObject {
         let dt = now - lastFrameTime
         lastFrameTime = now
 
-        // Pixel buffer backing the frame
         let attrs: [String: Any] = [
             kCVPixelBufferCGImageCompatibilityKey as String: true,
             kCVPixelBufferCGBitmapContextCompatibilityKey as String: true
@@ -152,10 +123,8 @@ final class Engine: ObservableObject {
         ctx.setFillColor(NSColor.black.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: width, height: height))
 
-        // Background with crossfade
         if fade < 1 { fade = min(1, fade + dt / 0.5) }
-        if fade < 1, let prev = previousID,
-           let s = sources.first(where: { $0.id == prev }) {
+        if fade < 1, let prev = previousID, let s = sources.first(where: { $0.id == prev }) {
             s.draw(in: ctx, width: width, height: height)
         }
         if let cur = programID, let s = sources.first(where: { $0.id == cur }) {
@@ -165,23 +134,23 @@ final class Engine: ObservableObject {
             ctx.restoreGState()
         }
 
-        // Layers: bottom of list first, top of list in front
+        let provider: (UUID) -> CGImage? = { [weak self] id in
+            self?.sources.first(where: { $0.id == id })?.currentImage()
+        }
         for layer in layers.reversed() {
             layer.liveT += (layer.isLive ? 1 : -1) * dt / 0.45
             layer.liveT = max(0, min(1, layer.liveT))
             if layer.liveT > 0 {
-                LayerRenderer.render(layer, in: ctx, width: width, height: height, time: now)
+                LayerRenderer.render(layer, in: ctx, width: width, height: height,
+                                     time: now, sourceImage: provider)
             }
         }
 
-        // Show in previews
         if let img = ctx.makeImage() {
             for v in consumers.allObjects { v.show(img) }
         }
 
-        // Append to recording
-        if isRecording, let input = videoInput, input.isReadyForMoreMediaData,
-           let adaptor = adaptor {
+        if isRecording, let input = videoInput, input.isReadyForMoreMediaData, let adaptor = adaptor {
             let pts = CMClockGetTime(CMClockGetHostTimeClock())
             adaptor.append(pb, withPresentationTime: pts)
         }
@@ -189,55 +158,41 @@ final class Engine: ObservableObject {
 
     // MARK: recording
 
-    func toggleRecording() {
-        isRecording ? stopRecording() : startRecording()
-    }
+    func toggleRecording() { isRecording ? stopRecording() : startRecording() }
 
     private func startRecording() {
         let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let url = movies.appendingPathComponent("LiveDeck_\(fmt.string(from: Date())).mp4")
 
         do {
             let w = try AVAssetWriter(outputURL: url, fileType: .mp4)
-
             let vSettings: [String: Any] = [
                 AVVideoCodecKey: AVVideoCodecType.h264,
-                AVVideoWidthKey: width,
-                AVVideoHeightKey: height,
-                AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: 6_000_000]
+                AVVideoWidthKey: width, AVVideoHeightKey: height,
+                AVVideoCompressionPropertiesKey: [AVVideoAverageBitRateKey: height >= 1080 ? 12_000_000 : 6_000_000]
             ]
             let vIn = AVAssetWriterInput(mediaType: .video, outputSettings: vSettings)
             vIn.expectsMediaDataInRealTime = true
             let ad = AVAssetWriterInputPixelBufferAdaptor(
                 assetWriterInput: vIn,
-                sourcePixelBufferAttributes: [
-                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-                ])
+                sourcePixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
             if w.canAdd(vIn) { w.add(vIn) }
 
             let aSettings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: 44100,
-                AVNumberOfChannelsKey: 1,
-                AVEncoderBitRateKey: 128_000
-            ]
+                AVFormatIDKey: kAudioFormatMPEG4AAC, AVSampleRateKey: 44100,
+                AVNumberOfChannelsKey: 1, AVEncoderBitRateKey: 128_000]
             let aIn = AVAssetWriterInput(mediaType: .audio, outputSettings: aSettings)
             aIn.expectsMediaDataInRealTime = true
             if w.canAdd(aIn) { w.add(aIn) }
 
-            mic.start()
+            audioCapture.start(deviceID: selectedAudioDeviceID)
             w.startWriting()
             w.startSession(atSourceTime: CMClockGetTime(CMClockGetHostTimeClock()))
 
-            writer = w
-            videoInput = vIn
-            audioInput = aIn
-            adaptor = ad
-            recordSeconds = 0
-            isRecording = true
+            writer = w; videoInput = vIn; audioInput = aIn; adaptor = ad
+            recordSeconds = 0; isRecording = true
             recordTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
                 self?.recordSeconds += 1
             }
@@ -248,11 +203,10 @@ final class Engine: ObservableObject {
 
     private func stopRecording() {
         isRecording = false
-        recordTimer?.invalidate()
-        recordTimer = nil
+        recordTimer?.invalidate(); recordTimer = nil
+        audioCapture.stop()
         guard let w = writer else { return }
-        videoInput?.markAsFinished()
-        audioInput?.markAsFinished()
+        videoInput?.markAsFinished(); audioInput?.markAsFinished()
         let url = w.outputURL
         w.finishWriting { [weak self] in
             DispatchQueue.main.async {
@@ -260,23 +214,17 @@ final class Engine: ObservableObject {
                 NSWorkspace.shared.activateFileViewerSelecting([url])
             }
         }
-        writer = nil
-        videoInput = nil
-        audioInput = nil
-        adaptor = nil
+        writer = nil; videoInput = nil; audioInput = nil; adaptor = nil
     }
 
     // MARK: snapshot
 
     func snapshot() {
-        // Render current preview content from the first consumer's layer
-        guard let v = consumers.allObjects.first,
-              let contents = v.layer?.contents else { return }
-        let img = contents as! CGImage
+        guard let c = consumers.allObjects.first?.layer?.contents else { return }
+        let img = c as! CGImage
         let rep = NSBitmapImageRep(cgImage: img)
         guard let data = rep.representation(using: .png, properties: [:]) else { return }
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
         let url = desktop.appendingPathComponent("LiveDeck_\(fmt.string(from: Date())).png")
@@ -284,13 +232,38 @@ final class Engine: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    // MARK: save / load show
+
+    func saveShow() {
+        let show = ShowFile(width: width, height: height, layers: layers.map { $0.toShowLayer() })
+        guard let data = try? JSONEncoder().encode(show) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Untitled.livedeck"
+        if let t = UTType(filenameExtension: "livedeck") { panel.allowedContentTypes = [t] }
+        panel.begin { resp in
+            if resp == .OK, let url = panel.url { try? data.write(to: url) }
+        }
+    }
+
+    func loadShow() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        if let t = UTType(filenameExtension: "livedeck") { panel.allowedContentTypes = [t] }
+        panel.begin { [weak self] resp in
+            guard let self, resp == .OK, let url = panel.url,
+                  let data = try? Data(contentsOf: url),
+                  let show = try? JSONDecoder().decode(ShowFile.self, from: data) else { return }
+            self.setResolution(width: show.width, height: show.height)
+            self.layers = show.layers.compactMap { Layer.from($0) }
+            self.selectedLayerID = self.layers.first?.id
+        }
+    }
+
     // MARK: output window
 
     func openOutputWindow() {
-        if let w = outputWindow {
-            w.makeKeyAndOrderFront(nil)
-            return
-        }
+        if let w = outputWindow { w.makeKeyAndOrderFront(nil); return }
         let view = FrameNSView(frame: NSRect(x: 0, y: 0, width: 960, height: 540))
         addConsumer(view)
         let win = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 960, height: 540),
@@ -314,10 +287,6 @@ final class FrameNSView: NSView {
         layer?.backgroundColor = NSColor.black.cgColor
         layer?.contentsGravity = .resizeAspect
     }
-
     required init?(coder: NSCoder) { fatalError("init(coder:) not supported") }
-
-    func show(_ image: CGImage) {
-        layer?.contents = image
-    }
+    func show(_ image: CGImage) { layer?.contents = image }
 }
